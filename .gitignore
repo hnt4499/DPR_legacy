@@ -1,0 +1,18 @@
+# Data
+downloads/
+outputs/
+outputs_named/
+outputs_named_reader/
+work_dirs/
+
+# Compile
+*.pyc
+dpr.egg-info/
+
+# Workspace
+workspace.code-workspace
+
+# Jupyter
+notebooks
+*.ipynb
+.ipynb_checkpoints/

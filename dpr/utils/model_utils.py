@@ -39,9 +39,10 @@ def setup_for_distributed_mode(
     local_rank: int = -1,
     fp16: bool = False,
     fp16_opt_level: str = "O1",
+    gradient_checkpointing: bool = False,
 ) -> (nn.Module, torch.optim.Optimizer):
     model.to(device)
-    if fp16:
+    if fp16 or (gradient_checkpointing and local_rank != -1):
         try:
             import apex
             from apex import amp
@@ -56,12 +57,18 @@ def setup_for_distributed_mode(
         model = torch.nn.DataParallel(model)
 
     if local_rank != -1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[device if device else local_rank],
-            output_device=local_rank,
-            find_unused_parameters=True,
-        )
+        if gradient_checkpointing:
+            model = apex.parallel.DistributedDataParallel(
+                model,
+                delay_allreduce=True,
+            )
+        else:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[device if device else local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True,
+            )
     return model, optimizer
 
 

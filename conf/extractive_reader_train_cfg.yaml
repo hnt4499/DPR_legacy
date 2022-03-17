@@ -52,6 +52,9 @@ gold_passages_src:
 # File with the original dataset passages (json format)
 gold_passages_src_dev:
 
+# Gradient checkpointing
+gradient_checkpointing: False
+
 # num of threads to pre-process data.
 num_workers: 16
 

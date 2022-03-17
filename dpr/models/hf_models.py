@@ -205,10 +205,19 @@ class HFBertEncoder(BertModel):
 
     @classmethod
     def init_encoder(
-        cls, cfg_name: str, projection_dim: int = 0, dropout: float = 0.1, pretrained: bool = True, **kwargs
+        cls,
+        cfg_name: str,
+        projection_dim: int = 0,
+        dropout: float = 0.1,
+        pretrained: bool = True,
+        gradient_checkpointing: bool = False,
+        **kwargs,
     ) -> BertModel:
         logger.info("Initializing HF BERT Encoder. cfg_name=%s", cfg_name)
-        cfg = BertConfig.from_pretrained(cfg_name if cfg_name else "bert-base-uncased")
+        cfg = BertConfig.from_pretrained(
+            cfg_name if cfg_name else "bert-base-uncased",
+            gradient_checkpointing=gradient_checkpointing,
+        )
         if dropout != 0:
             cfg.attention_probs_dropout_prob = dropout
             cfg.hidden_dropout_prob = dropout
