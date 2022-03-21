@@ -20,6 +20,7 @@ from typing import Tuple, List, Dict
 
 import regex as re
 
+import nltk
 from dpr.data.retriever_data import TableChunk
 from dpr.utils.tokenizers import SimpleTokenizer
 
@@ -213,6 +214,18 @@ def regex_match(text, pattern):
 # function for the reader model answer validation
 def exact_match_score(prediction, ground_truth):
     return _normalize_answer(prediction) == _normalize_answer(ground_truth)
+
+
+def f1_score(prediction, ground_truth, eps=1e-8):
+    # Normalize and tokenize
+    prediction = nltk.tokenize.word_tokenize(_normalize_answer(prediction))
+    ground_truth = nltk.tokenize.word_tokenize(_normalize_answer(ground_truth))
+    # Calculate
+    num_correct_words = sum([p in ground_truth for p in prediction])
+    precision = num_correct_words / len(prediction) if len(prediction) > 0 else 0
+    recall = num_correct_words / len(ground_truth) if len(ground_truth) > 0 else 0
+    f1 = 2 / (1 / (recall + eps) + 1 / (precision + eps))
+    return f1
 
 
 def _normalize_answer(s):

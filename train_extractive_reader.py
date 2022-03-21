@@ -25,7 +25,7 @@ from omegaconf import DictConfig, OmegaConf
 from typing import List
 
 
-from dpr.data.qa_validation import exact_match_score
+from dpr.data.qa_validation import exact_match_score, f1_score
 from dpr.data.reader_data import (
     ReaderSample,
     get_best_spans,
@@ -41,6 +41,7 @@ from dpr.options import (
     get_encoder_params_state_from_cfg,
     setup_logger,
 )
+
 from dpr.utils.data_utils import (
     ShardedDataIterator,
 )
@@ -53,6 +54,7 @@ from dpr.utils.model_utils import (
     setup_for_distributed_mode,
     get_model_obj,
 )
+from dpr.utils.dist_utils import gather
 
 logger = logging.getLogger()
 setup_logger(logger)
@@ -100,8 +102,10 @@ class ReaderTrainer(object):
         self.scheduler_state = None
         self.best_validation_result = None
         self.best_cp_name = None
+
+        self.model_file = model_file
         if saved_state:
-            self._load_saved_state(saved_state)
+            self._load_saved_state(saved_state, resume=cfg.resume)
 
     def get_data_iterator(
         self,
@@ -181,6 +185,13 @@ class ReaderTrainer(object):
         else:
             scheduler = get_schedule_linear(self.optimizer, warmup_steps, total_updates)
 
+        # Eval before any training, but no checkpointing
+        if self.model_file is not None and self.cfg.eval_first:
+            logger.info("Evaluate loaded model before any training...")
+            self.validate_and_save(
+                self.start_epoch, iteration=None, scheduler=None, save_cp=False,
+            )
+
         eval_step = cfg.train.eval_step
         logger.info("  Eval step = %d", eval_step)
         logger.info("***** Training *****")
@@ -196,10 +207,10 @@ class ReaderTrainer(object):
 
         return
 
-    def validate_and_save(self, epoch: int, iteration: int, scheduler):
+    def validate_and_save(self, epoch: int, iteration: int, scheduler, save_cp: bool = True):
         cfg = self.cfg
         # in distributed DDP mode, save checkpoint for only one process
-        save_cp = cfg.local_rank in [-1, 0]
+        save_cp = save_cp and cfg.local_rank in [-1, 0]
         reader_validation_score = self.validate()
 
         if save_cp:
@@ -255,17 +266,37 @@ class ReaderTrainer(object):
                 logger.info("Eval step: %d ", i)
 
         ems = defaultdict(list)
+        f1s = defaultdict(list)
 
         for q_predictions in all_results:
             gold_answers = q_predictions.gold_answers
             span_predictions = q_predictions.predictions  # {top docs threshold -> SpanPrediction()}
             for (n, span_prediction) in span_predictions.items():
-                em_hit = max([exact_match_score(span_prediction.prediction_text, ga) for ga in gold_answers])
+                em_hit = max(
+                    exact_match_score(span_prediction.prediction_text, ga)
+                    for ga in gold_answers
+                )
                 ems[n].append(em_hit)
+                f1_hit = max(
+                    f1_score(span_prediction.prediction_text, ga)
+                    for ga in gold_answers
+                )
+                f1s[n].append(f1_hit)
+
+        # Sync between GPUs
+        ems, f1s = gather(self.cfg, [ems, f1s])
+
         em = 0
-        for n in sorted(ems.keys()):
-            em = np.mean(ems[n])
+        for n in sorted(ems[0].keys()):
+            ems_n = sum([em[n] for em in ems], [])  # gather and concatenate
+            em = np.mean(ems_n)
             logger.info("n=%d\tEM %.2f" % (n, em * 100))
+
+        f1 = 0
+        for n in sorted(f1s[0].keys()):
+            f1s_n = sum([f1[n] for f1 in f1s], [])  # gather and concatenate
+            f1 = np.mean(f1s_n)
+            logger.info("n=%d\tF1 %.2f" % (n, f1 * 100))
 
         if cfg.prediction_results_file:
             self._save_predictions(cfg.prediction_results_file, all_results)
@@ -391,24 +422,26 @@ class ReaderTrainer(object):
         torch.save(state._asdict(), cp)
         return cp
 
-    def _load_saved_state(self, saved_state: CheckpointState):
-        epoch = saved_state.epoch
-        offset = saved_state.offset
-        if offset == 0:  # epoch has been completed
-            epoch += 1
-        logger.info("Loading checkpoint @ batch=%s and epoch=%s", offset, epoch)
-        self.start_epoch = epoch
-        self.start_batch = offset
-
+    def _load_saved_state(self, saved_state: CheckpointState, resume: bool):
+        # Load model weights
         model_to_load = get_model_obj(self.reader)
         if saved_state.model_dict:
             logger.info("Loading model weights from saved state ...")
             model_to_load.load_state_dict(saved_state.model_dict, strict=False)
 
-        logger.info("Loading saved optimizer state ...")
-        if saved_state.optimizer_dict:
-            self.optimizer.load_state_dict(saved_state.optimizer_dict)
-        self.scheduler_state = saved_state.scheduler_dict
+        if resume:
+            epoch = saved_state.epoch
+            offset = saved_state.offset
+            if offset == 0:  # epoch has been completed
+                epoch += 1
+            logger.info("Loading checkpoint @ batch=%s and epoch=%s", offset, epoch)
+            self.start_epoch = epoch
+            self.start_batch = offset
+
+            logger.info("Loading saved optimizer state ...")
+            if saved_state.optimizer_dict:
+                self.optimizer.load_state_dict(saved_state.optimizer_dict)
+            self.scheduler_state = saved_state.scheduler_dict
 
     def _get_best_prediction(
         self,

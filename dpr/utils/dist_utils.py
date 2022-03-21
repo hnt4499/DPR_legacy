@@ -10,8 +10,10 @@ Utilities for distributed model training
 """
 
 import pickle
+from typing import Tuple, List, Any
 
 import torch
+from torch import Tensor as T
 import torch.distributed as dist
 
 
@@ -33,7 +35,11 @@ def all_reduce(tensor, group=None):
     return dist.all_reduce(tensor, group=group)
 
 
-def all_gather_list(data, group=None, max_size=16384):
+def all_gather_list(
+    data: Any,
+    group=None,
+    max_size: int = None,
+):
     """Gathers arbitrary data from all nodes into a list.
     Similar to :func:`~torch.distributed.all_gather` but for arbitrary Python
     data. Note that *data* must be picklable.
@@ -46,9 +52,22 @@ def all_gather_list(data, group=None, max_size=16384):
     enc = pickle.dumps(data)
     enc_size = len(enc)
 
-    if enc_size + SIZE_STORAGE_BYTES > max_size:
+    if max_size is None:
+        # All processes must use the same buffer size
+        max_size = enc_size + SIZE_STORAGE_BYTES
+        max_sizes = gather(
+            cfg=None,
+            objects_to_sync=[max_size],
+            buffer_size=1000,
+        )[0]
+        max_size = max(max_sizes)
+        max_size = round(max_size * 1.1)  # take 110%
+
+    elif enc_size + SIZE_STORAGE_BYTES > max_size:
         raise ValueError(
-            'encoded data exceeds max_size, this can be fixed by increasing buffer size: {}'.format(enc_size))
+            f'encoded data exceeds max_size, this can be fixed by increasing '
+            f'buffer size: {enc_size}'
+        )
 
     rank = get_rank()
     world_size = get_world_size()
@@ -94,3 +113,74 @@ def all_gather_list(data, group=None, max_size=16384):
             'in your training script that can cause one worker to finish an epoch '
             'while other workers are still iterating over their portions of the data.'
         )
+
+
+def gather(
+    cfg,
+    objects_to_sync: List[Any],
+    buffer_size: int = None,
+) -> List[Tuple]:
+    """
+    Helper function to gather arbitrary objects.
+
+    Args:
+        objects_to_sync (List[Any]): List of any arbitrary objects. This list
+            should be of the same size across all processes.
+
+    Returns
+        gathered_objects (List[Tuple]):  List of size `num_objects`, where
+            `num_objects` is the number of objects in `objects_to_sync` input.
+            Each element in this list is a tuple of gathered objects from
+            multiple processes (of the same object).
+    """
+    if not dist.is_initialized():
+        return [[obj] for obj in objects_to_sync]
+
+    local_rank = dist.get_rank()
+    distributed_world_size = dist.get_world_size()
+
+    if distributed_world_size > 1:
+        # For tensors that reside on GPU, we first need to detach it from its
+        # computation graph, clone it, and then transfer it to CPU
+        on_gpus = []
+        copied_objects_to_sync = []
+        for object in objects_to_sync:
+            if isinstance(object, T) and object.is_cuda:
+                on_gpus.append(1)
+                copied_object_to_sync = torch.empty_like(  # clone, detach and transfer to CPU
+                    object, device="cpu"
+                ).copy_(object).detach_()
+                copied_objects_to_sync.append(copied_object_to_sync)
+            else:
+                on_gpus.append(0)
+                copied_objects_to_sync.append(object)
+
+        global_objects_to_sync = all_gather_list(
+            [local_rank, copied_objects_to_sync],
+            max_size=buffer_size,
+        )
+        # Sort gathered objects according to ranks, so that all processes
+        # will receive the same objects in the same order
+        global_objects_to_sync = sorted(global_objects_to_sync, key=lambda x: x[0])
+
+        gathered_objects = []
+        for rank, items in global_objects_to_sync:
+            if rank == local_rank:
+                gathered_objects.append(objects_to_sync)  # not the copied ones
+            else:
+                # `items` is a list of objects from `local_rank=rank`
+                # If any object originally resides on GPU, we need
+                # to transfer it back
+                assert len(items) == len(on_gpus)
+                copied_items = []
+                for item, on_gpu in zip(items, on_gpus):
+                    if on_gpu:
+                        item = item.to(cfg.device)
+                    copied_items.append(item)
+                gathered_objects.append(copied_items)
+
+    else:
+        gathered_objects = [objects_to_sync]
+
+    gathered_objects = list(zip(*gathered_objects))
+    return gathered_objects

@@ -6,6 +6,9 @@ defaults:
 
 # A trained reader checkpoint file to initialize the model
 model_file:
+# These configs are only applicable when `model_file` is specified
+resume: True  # whether to resume training
+eval_first: True  # whether to evaluate the loaded model straightaway before any training
 
 # Whether to lower case the input text. Set True for uncased models, False for the cased ones.
 do_lower_case: True
