@@ -98,11 +98,11 @@ class BiEncoderTrainer(object):
         self.best_cp_name = None
         self.cfg = cfg
         self.ds_cfg = BiencoderDatasetsCfg(cfg)
-
-        if saved_state:
-            self._load_saved_state(saved_state)
-
         self.dev_iterator = None
+
+        self.model_file = model_file
+        if saved_state:
+            self._load_saved_state(saved_state, resume=cfg.resume)
 
     def get_data_iterator(
         self,
@@ -185,6 +185,13 @@ class BiEncoderTrainer(object):
         else:
             scheduler = get_schedule_linear(self.optimizer, warmup_steps, total_updates)
 
+        # Eval before any training, but no checkpointing
+        if self.model_file is not None and self.cfg.eval_first:
+            logger.info("Evaluate loaded model before any training...")
+            self.validate_and_save(
+                self.start_epoch, iteration=None, scheduler=None, save_cp=False,
+            )
+
         eval_step = math.ceil(updates_per_epoch / cfg.train.eval_per_epoch)
         logger.info("  Eval step = %d", eval_step)
         logger.info("***** Training *****")
@@ -196,10 +203,10 @@ class BiEncoderTrainer(object):
         if cfg.local_rank in [-1, 0]:
             logger.info("Training finished. Best validation checkpoint %s", self.best_cp_name)
 
-    def validate_and_save(self, epoch: int, iteration: int, scheduler):
+    def validate_and_save(self, epoch: int, iteration: int, scheduler, save_cp: bool = True):
         cfg = self.cfg
         # for distributed mode, save checkpoint for only one process
-        save_cp = cfg.local_rank in [-1, 0]
+        save_cp = save_cp and cfg.local_rank in [-1, 0]
 
         if epoch == cfg.val_av_rank_start_epoch:
             self.best_validation_result = None
@@ -418,7 +425,7 @@ class BiEncoderTrainer(object):
         if distributed_factor > 1:
             # each node calcuated its own rank, exchange the information between node and calculate the "global" average rank
             # NOTE: the set of passages is still unique for every node
-            eval_stats = all_gather_list([rank, q_num], max_size=100)
+            eval_stats = all_gather_list([rank, q_num])
             for i, item in enumerate(eval_stats):
                 remote_rank, remote_q_num = item
                 if i != cfg.local_rank:
@@ -571,35 +578,37 @@ class BiEncoderTrainer(object):
         logger.info("Saved checkpoint at %s", cp)
         return cp
 
-    def _load_saved_state(self, saved_state: CheckpointState):
-        epoch = saved_state.epoch
-        # offset is currently ignored since all checkpoints are made after full epochs
-        offset = saved_state.offset
-        if offset == 0:  # epoch has been completed
-            epoch += 1
-        logger.info("Loading checkpoint @ batch=%s and epoch=%s", offset, epoch)
-
-        if self.cfg.ignore_checkpoint_offset:
-            self.start_epoch = 0
-            self.start_batch = 0
-        else:
-            self.start_epoch = epoch
-            # TODO: offset doesn't work for multiset currently
-            self.start_batch = 0  # offset
-
+    def _load_saved_state(self, saved_state: CheckpointState, resume: bool):
+        # Load model weights
         model_to_load = get_model_obj(self.biencoder)
         logger.info("Loading saved model state ...")
-
         model_to_load.load_state(saved_state, strict=True)
-        logger.info("Saved state loaded")
-        if not self.cfg.ignore_checkpoint_optimizer:
-            if saved_state.optimizer_dict:
-                logger.info("Using saved optimizer state")
-                self.optimizer.load_state_dict(saved_state.optimizer_dict)
 
-        if not self.cfg.ignore_checkpoint_lr and saved_state.scheduler_dict:
-            logger.info("Using saved scheduler_state")
-            self.scheduler_state = saved_state.scheduler_dict
+        if resume:
+            epoch = saved_state.epoch
+            # offset is currently ignored since all checkpoints are made after full epochs
+            offset = saved_state.offset
+            if offset == 0:  # epoch has been completed
+                epoch += 1
+            logger.info("Loading checkpoint @ batch=%s and epoch=%s", offset, epoch)
+
+            if self.cfg.ignore_checkpoint_offset:
+                self.start_epoch = 0
+                self.start_batch = 0
+            else:
+                self.start_epoch = epoch
+                # TODO: offset doesn't work for multiset currently
+                self.start_batch = 0  # offset
+
+            logger.info("Saved state loaded")
+            if not self.cfg.ignore_checkpoint_optimizer:
+                if saved_state.optimizer_dict:
+                    logger.info("Using saved optimizer state")
+                    self.optimizer.load_state_dict(saved_state.optimizer_dict)
+
+            if not self.cfg.ignore_checkpoint_lr and saved_state.scheduler_dict:
+                logger.info("Using saved scheduler_state")
+                self.scheduler_state = saved_state.scheduler_dict
 
 
 def _calc_loss(
@@ -627,7 +636,6 @@ def _calc_loss(
                 local_positive_idxs,
                 local_hard_negatives_idxs,
             ],
-            max_size=cfg.global_loss_buf_sz,
         )
 
         global_q_vector = []
