@@ -17,6 +17,7 @@ import random
 import sys
 import time
 from typing import Tuple
+import yaml
 
 import hydra
 import torch
@@ -762,6 +763,10 @@ def main(cfg: DictConfig):
     if cfg.local_rank in [-1, 0]:
         logger.info("CFG (after gpu  configuration):")
         logger.info("%s", OmegaConf.to_yaml(cfg))
+
+        # Save config
+        with open("config.yaml", "w") as fout:
+            yaml.dump(eval(str(cfg)), fout)
 
     trainer = BiEncoderTrainer(cfg)
 
