@@ -184,3 +184,9 @@ def gather(
 
     gathered_objects = list(zip(*gathered_objects))
     return gathered_objects
+
+
+def synchronize():
+    if dist.is_initialized():
+        dist.barrier()
+    return
